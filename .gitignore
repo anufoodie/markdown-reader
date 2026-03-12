@@ -1,0 +1,17 @@
+# Build output
+Markdown Reader.app/
+MarkdownReader
+
+# Generated icon assets (regenerated on build)
+AppIcon.iconset/
+AppIcon.icns
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode
+*.xcworkspace
+*.xcuserdata
+DerivedData/
