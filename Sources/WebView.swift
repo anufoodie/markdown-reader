@@ -3,6 +3,22 @@ import WebKit
 
 class WebViewRef: ObservableObject {
     var webView: WKWebView?
+
+    func find(_ text: String, backwards: Bool = false, completion: ((Bool) -> Void)? = nil) {
+        guard let webView else { return }
+        let config = WKFindConfiguration()
+        config.wraps = true
+        config.caseSensitive = false
+        config.backwards = backwards
+        if text.isEmpty {
+            webView.find("", configuration: config) { _ in completion?(false) }
+        } else {
+            webView.find(text, configuration: config) { result in completion?(result.matchFound) }
+        }
+    }
+
+    func findNext(_ text: String) { find(text, backwards: false) }
+    func findPrevious(_ text: String) { find(text, backwards: true) }
 }
 
 struct MarkdownWebView: NSViewRepresentable {
@@ -11,10 +27,15 @@ struct MarkdownWebView: NSViewRepresentable {
     let theme: AppTheme
     let fontSize: Int
     let webViewRef: WebViewRef
+    var fileURL: URL? = nil
+    var onWikilinkTapped: (String) -> Void = { _ in }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onWikilinkTapped: onWikilinkTapped) }
 
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        config.userContentController.add(context.coordinator, name: "wikilink")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
         webViewRef.webView = webView
@@ -23,6 +44,7 @@ struct MarkdownWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.onWikilinkTapped = onWikilinkTapped
         loadContent(webView)
     }
 
@@ -33,7 +55,25 @@ struct MarkdownWebView: NSViewRepresentable {
             theme: theme,
             fontSize: fontSize
         )
-        webView.loadHTMLString(html, baseURL: nil)
+        let base = fileURL?.deletingLastPathComponent()
+        webView.loadHTMLString(html, baseURL: base)
+    }
+
+    // MARK: - Coordinator (handles wikilink messages from JS)
+
+    class Coordinator: NSObject, WKScriptMessageHandler {
+        var onWikilinkTapped: (String) -> Void
+
+        init(onWikilinkTapped: @escaping (String) -> Void) {
+            self.onWikilinkTapped = onWikilinkTapped
+        }
+
+        func userContentController(_ userContentController: WKUserContentController,
+                                   didReceive message: WKScriptMessage) {
+            if message.name == "wikilink", let target = message.body as? String {
+                DispatchQueue.main.async { self.onWikilinkTapped(target) }
+            }
+        }
     }
 }
 
@@ -442,6 +482,10 @@ struct MarkdownHTMLRenderer {
 
     /* ── Images ── */
     img { max-width: 100%; height: auto; border-radius: 12px; margin: 1.2em 0; box-shadow: var(--shadow-md); }
+
+    /* ── Wikilinks ── */
+    a.wikilink { color: var(--accent); border-bottom: 1px dashed var(--accent); }
+    a.wikilink:hover { border-bottom-style: solid; }
 
     /* ── Misc ── */
     del { color: var(--text-secondary); text-decoration: line-through; }

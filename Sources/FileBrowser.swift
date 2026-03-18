@@ -273,6 +273,23 @@ class FileBrowserModel: ObservableObject {
         }
     }
 
+    // MARK: - Mounted volumes (SSHFS, external drives, network shares)
+
+    var mountedVolumes: [PinnedFolder] {
+        let volumesURL = URL(fileURLWithPath: "/Volumes")
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: volumesURL,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: .skipsHiddenFiles
+        ) else { return [] }
+        return contents.compactMap { url in
+            // Skip the macOS root symlink
+            if let vals = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]),
+               vals.isSymbolicLink == true { return nil }
+            return PinnedFolder(path: url.path, name: url.lastPathComponent, icon: "externaldrive")
+        }.sorted { $0.name < $1.name }
+    }
+
     // MARK: - File selection (handled by ContentView)
 
     func openFile(_ file: MarkdownFile) {
@@ -362,12 +379,26 @@ struct FileBrowserView: View {
                 ForEach(model.pinnedFolders) { folder in
                     folderRow(folder)
                 }
+
+                let volumes = model.mountedVolumes
+                if !volumes.isEmpty {
+                    Text("VOLUMES")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.6))
+                        .padding(.leading, 10)
+                        .padding(.top, 8)
+                        .padding(.bottom, 2)
+                    ForEach(volumes) { vol in
+                        folderRow(vol)
+                    }
+                }
+
                 addFolderRow
             }
             .padding(.vertical, 6)
             .padding(.horizontal, 6)
         }
-        .frame(maxHeight: 180)
+        .frame(maxHeight: 200)
     }
 
     private func folderRow(_ folder: PinnedFolder) -> some View {

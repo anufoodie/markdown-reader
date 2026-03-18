@@ -5,16 +5,10 @@ import AppKit
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = true
-        // Force tab mode on all windows
-        for window in NSApp.windows {
-            window.tabbingMode = .preferred
-        }
+        for window in NSApp.windows { window.tabbingMode = .preferred }
     }
-
     func applicationDidBecomeActive(_ notification: Notification) {
-        for window in NSApp.windows {
-            window.tabbingMode = .preferred
-        }
+        for window in NSApp.windows { window.tabbingMode = .preferred }
     }
 }
 
@@ -24,7 +18,7 @@ struct MarkdownReaderApp: App {
 
     var body: some Scene {
         DocumentGroup(newDocument: MarkdownDocument()) { file in
-            ContentView(document: file.$document)
+            ContentView(document: file.$document, fileURL: file.fileURL)
         }
         .commands {
             CommandGroup(after: .textFormatting) {
@@ -37,6 +31,18 @@ struct MarkdownReaderApp: App {
                     NotificationCenter.default.post(name: .toggleTOC, object: nil)
                 }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Find in Document") {
+                    NotificationCenter.default.post(name: .findInDocument, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: [.command])
+
+                Button("Quick Open") {
+                    NotificationCenter.default.post(name: .quickOpen, object: nil)
+                }
+                .keyboardShortcut("p", modifiers: [.command])
 
                 Divider()
 
@@ -67,10 +73,12 @@ struct MarkdownReaderApp: App {
 }
 
 extension Notification.Name {
-    static let toggleEditor = Notification.Name("toggleEditor")
-    static let toggleTOC = Notification.Name("toggleTOC")
-    static let collapseAll = Notification.Name("collapseAll")
-    static let expandAll = Notification.Name("expandAll")
-    static let fontSizeUp = Notification.Name("fontSizeUp")
-    static let fontSizeDown = Notification.Name("fontSizeDown")
+    static let toggleEditor     = Notification.Name("toggleEditor")
+    static let toggleTOC        = Notification.Name("toggleTOC")
+    static let findInDocument   = Notification.Name("findInDocument")
+    static let quickOpen        = Notification.Name("quickOpen")
+    static let collapseAll      = Notification.Name("collapseAll")
+    static let expandAll        = Notification.Name("expandAll")
+    static let fontSizeUp       = Notification.Name("fontSizeUp")
+    static let fontSizeDown     = Notification.Name("fontSizeDown")
 }

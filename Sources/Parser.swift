@@ -217,6 +217,19 @@ struct MarkdownParser {
     static func inlineFormat(_ text: String) -> String {
         var s = text
 
+        // Wikilinks [[page|display]] with optional display text
+        s = s.replacingOccurrences(
+            of: #"\[\[([^\]|]+)\|([^\]]+)\]\]"#,
+            with: "<a href=\"#\" onclick=\"window.webkit.messageHandlers.wikilink.postMessage('$1');return false;\" class=\"wikilink\">$2</a>",
+            options: .regularExpression
+        )
+        // Wikilinks [[page]]
+        s = s.replacingOccurrences(
+            of: #"\[\[([^\]|]+)\]\]"#,
+            with: "<a href=\"#\" onclick=\"window.webkit.messageHandlers.wikilink.postMessage('$1');return false;\" class=\"wikilink\">$1</a>",
+            options: .regularExpression
+        )
+
         // Images
         s = s.replacingOccurrences(
             of: #"!\[([^\]]*)\]\(([^)]+)\)"#,
