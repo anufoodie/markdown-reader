@@ -1,59 +1,86 @@
 #!/usr/bin/swift
 import AppKit
+import CoreText
 import CoreGraphics
 
-// ── Design constants (at 1000×1000 canvas) ──────────────────────────────────
-// M occupies x=[100, 560]  D occupies x=[470, 920]  Shared vertical x=[470,560]
-// Stroke width 90 (9% of canvas) — converted to filled path via copy(strokingWith:)
+// ── Glyph path for "MD" using Helvetica Neue Heavy ────────────────────────────
+// Uses actual font outlines so letterforms are typographically correct.
+// Even padding (12% each side) keeps letters well within the square canvas.
 
-func mdFilledPath(s: CGFloat) -> CGPath {
-    let k = s / 1000       // scale factor
+func mdGlyphPath(canvasSize s: CGFloat) -> CGPath {
+    let padding = s * 0.12
+    let maxW    = s - 2 * padding
+    let maxH    = s - 2 * padding
 
-    func p(_ x: CGFloat, _ y: CGFloat) -> CGPoint { CGPoint(x: x*k, y: y*k) }
+    // Pick the heaviest available Helvetica variant
+    let candidates = ["HelveticaNeue-Heavy", "HelveticaNeue-Bold", "Helvetica-Bold"]
+    func available(_ name: String) -> Bool {
+        let f = CTFontCreateWithName(name as CFString, 12, nil)
+        return (CTFontCopyPostScriptName(f) as String) == name
+    }
+    let fontName = candidates.first(where: available) ?? "Helvetica-Bold"
 
-    let strokeW = s * 0.093
-    let lb: CGFloat = 110   // letter bottom (canvas units)
-    let lt: CGFloat = 890   // letter top
-    let vm: CGFloat = 390   // V apex height — lower = deeper V
+    // Measure at a large trial size, then scale linearly to fit padded area
+    let trial: CGFloat = 600
+    let trialFont = CTFontCreateWithName(fontName as CFString, trial, nil)
+    let trialLine = CTLineCreateWithAttributedString(
+        NSAttributedString(string: "MD",
+                           attributes: [kCTFontAttributeName as NSAttributedString.Key: trialFont])
+    )
+    let trialBounds = CTLineGetBoundsWithOptions(trialLine, .useGlyphPathBounds)
+    guard trialBounds.width > 0, trialBounds.height > 0 else { return CGMutablePath() }
 
-    // Centre-line paths for every stroke of M and D
-    let lines = CGMutablePath()
+    let scale    = min(maxW / trialBounds.width, maxH / trialBounds.height)
+    let fontSize = trial * scale
 
-    // M — left vertical
-    lines.move(to: p(145, lt));  lines.addLine(to: p(145, lb))
-    // M — left diagonal  (top-left → V apex)
-    lines.move(to: p(145, lt));  lines.addLine(to: p(345, vm))
-    // M — right diagonal (V apex → top of shared vertical)
-    lines.move(to: p(345, vm));  lines.addLine(to: p(515, lt))
-    // Shared vertical  (right of M = left of D)
-    lines.move(to: p(515, lt));  lines.addLine(to: p(515, lb))
+    // Final font + line at the target size
+    let font = CTFontCreateWithName(fontName as CFString, fontSize, nil)
+    let line = CTLineCreateWithAttributedString(
+        NSAttributedString(string: "MD",
+                           attributes: [kCTFontAttributeName as NSAttributedString.Key: font])
+    )
+    let bounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
 
-    // D — top horizontal bar
-    lines.move(to: p(515, lt));  lines.addLine(to: p(695, lt))
-    // D — bottom horizontal bar
-    lines.move(to: p(515, lb));  lines.addLine(to: p(695, lb))
-    // D — right arc (cubic bezier — symmetric, rightmost ~x=882 at mid-height)
-    lines.move(to: p(695, lt))
-    lines.addCurve(to: p(695, lb),
-                   control1: p(960, lt),
-                   control2: p(960, lb))
+    // Stretch glyphs 20% taller; recentre using the enlarged dimensions
+    let vScale: CGFloat = 1.2
+    let tx = (s - bounds.width)          / 2 - bounds.origin.x
+    let ty = (s - bounds.height * vScale) / 2 - bounds.origin.y * vScale
 
-    // Expand strokes → filled region
-    return lines.copy(strokingWithWidth: strokeW,
-                      lineCap:  .butt,
-                      lineJoin: .miter,
-                      miterLimit: 3)
+    // Extract per-glyph CGPath outlines, apply vertical stretch + translation
+    let combined = CGMutablePath()
+    let runs = CTLineGetGlyphRuns(line) as! [CTRun]
+    for run in runs {
+        let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName] as! CTFont
+        let n = CTRunGetGlyphCount(run)
+        var glyphs    = [CGGlyph](repeating: 0,     count: n)
+        var positions = [CGPoint](repeating: .zero, count: n)
+        CTRunGetGlyphs(run,    CFRangeMake(0, n), &glyphs)
+        CTRunGetPositions(run, CFRangeMake(0, n), &positions)
+        for (g, pos) in zip(glyphs, positions) {
+            if let path = CTFontCreatePathForGlyph(runFont, g, nil) {
+                // a=1 b=0 c=0 d=vScale: scale y, pass x unchanged; then translate
+                let t = CGAffineTransform(a: 1, b: 0, c: 0, d: vScale,
+                                          tx: tx + pos.x,
+                                          ty: ty + pos.y * vScale)
+                combined.addPath(path, transform: t)
+            }
+        }
+    }
+    return combined
 }
 
 // ── Rainbow bands ─────────────────────────────────────────────────────────────
-// 6 bold, distinct horizontal bands (bottom→top: red → violet)
+// 6 bold horizontal bands, bottom → top: red → violet
+
 let rainbowColors: [(CGFloat, CGFloat, CGFloat)] = [
-    (0.95, 0.13, 0.13),   // 1 — red
-    (1.00, 0.56, 0.05),   // 2 — orange
-    (1.00, 0.86, 0.05),   // 3 — yellow
-    (0.13, 0.78, 0.37),   // 4 — green
-    (0.10, 0.53, 0.98),   // 5 — blue
-    (0.65, 0.15, 0.95),   // 6 — violet
+    (0.95, 0.13, 0.13),   // red
+    (1.00, 0.56, 0.05),   // orange
+    (1.00, 0.86, 0.05),   // yellow
+    (0.13, 0.78, 0.37),   // green
+    (0.05, 0.75, 0.75),   // cyan
+    (0.10, 0.53, 0.98),   // blue
+    (0.65, 0.15, 0.95),   // violet
+    (0.95, 0.15, 0.65),   // magenta
 ]
 
 // ── Draw ──────────────────────────────────────────────────────────────────────
@@ -67,29 +94,22 @@ func drawIcon(size: Int) -> NSImage {
         image.unlockFocus(); return image
     }
 
-    // Background — very dark navy-black
+    // Background — deep navy-black
     ctx.setFillColor(CGColor(red: 0.05, green: 0.05, blue: 0.09, alpha: 1))
     ctx.fill(CGRect(x: 0, y: 0, width: s, height: s))
 
-    // Apply the MD path as a clip
-    let letterClip = mdFilledPath(s: s)
-    ctx.addPath(letterClip)
+    // Clip to "MD" glyph outlines
+    let glyphs = mdGlyphPath(canvasSize: s)
+    ctx.addPath(glyphs)
     ctx.clip()
 
-    // Draw rainbow bands (bottom→top)
+    // Fill rainbow bands inside the clipped letterforms
     let nBands = CGFloat(rainbowColors.count)
     let bandH  = s / nBands
     for (i, (r, g, b)) in rainbowColors.enumerated() {
         ctx.setFillColor(CGColor(red: r, green: g, blue: b, alpha: 1))
         ctx.fill(CGRect(x: 0, y: CGFloat(i) * bandH, width: s, height: bandH))
     }
-
-    // Thin white inner stroke for crispness at large sizes
-    ctx.resetClip()
-    ctx.addPath(letterClip)
-    ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.08))
-    ctx.setLineWidth(max(1, s * 0.003))
-    ctx.strokePath()
 
     image.unlockFocus()
     return image
@@ -102,13 +122,13 @@ func savePNG(_ image: NSImage, at path: String, pixelSize: Int) {
           let src  = CGImageSourceCreateWithData(tiff as CFData, nil),
           let cg   = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
 
-    let cs  = CGColorSpaceCreateDeviceRGB()
+    let cs = CGColorSpaceCreateDeviceRGB()
     guard let bmp = CGContext(data: nil, width: pixelSize, height: pixelSize,
                               bitsPerComponent: 8, bytesPerRow: 0, space: cs,
                               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
     else { return }
 
-    // Rounded corners at render time (so all sizes match macOS icon shape)
+    // macOS-style rounded corners
     let radius = CGFloat(pixelSize) * 0.22
     bmp.beginPath()
     bmp.addPath(CGPath(roundedRect: CGRect(x: 0, y: 0, width: pixelSize, height: pixelSize),
@@ -130,12 +150,10 @@ func savePNG(_ image: NSImage, at path: String, pixelSize: Int) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-let fm   = FileManager.default
-let dir  = "./AppIcon.iconset"
+let fm  = FileManager.default
+let dir = "./AppIcon.iconset"
 try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
 
-// Render at the two largest sizes and scale down for smaller slots
-// (avoids re-running the full draw for every size)
 print("Rendering icon…")
 let master = drawIcon(size: 1024)
 
