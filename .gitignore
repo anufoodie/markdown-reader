@@ -15,3 +15,12 @@ AppIcon.icns
 *.xcworkspace
 *.xcuserdata
 DerivedData/
+
+# Review sidecars — legacy path next to .md (new storage lives in ~/Library/Application Support)
+*.review.json
+
+# Test binary
+/tmp/test-bin
+
+# Screenshots
+/tmp/mdr-shots/
