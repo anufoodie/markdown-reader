@@ -21,6 +21,25 @@ struct MarkdownReaderApp: App {
             ContentView(document: file.$document, fileURL: file.fileURL)
         }
         .commands {
+            CommandMenu("Review") {
+                Button("Toggle Review Mode") {
+                    NotificationCenter.default.post(name: .toggleReviewMode, object: nil)
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+
+                Button("Toggle Comments Drawer") {
+                    NotificationCenter.default.post(name: .toggleReviewDrawer, object: nil)
+                }
+                .keyboardShortcut("c", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Finish Review (Generate Payload)") {
+                    NotificationCenter.default.post(name: .finishReview, object: nil)
+                }
+                .keyboardShortcut(.return, modifiers: [.command])
+            }
+
             CommandGroup(after: .textFormatting) {
                 Button("Toggle Editor") {
                     NotificationCenter.default.post(name: .toggleEditor, object: nil)
@@ -81,4 +100,7 @@ extension Notification.Name {
     static let expandAll        = Notification.Name("expandAll")
     static let fontSizeUp       = Notification.Name("fontSizeUp")
     static let fontSizeDown     = Notification.Name("fontSizeDown")
+    static let toggleReviewMode = Notification.Name("toggleReviewMode")
+    static let toggleReviewDrawer = Notification.Name("toggleReviewDrawer")
+    static let finishReview     = Notification.Name("finishReview")
 }

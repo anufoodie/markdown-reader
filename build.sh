@@ -55,7 +55,11 @@ fi
 
 rm "$EXEC_NAME"
 
-# ── 5. Register with Launch Services ──
+# ── 5. Ad-hoc code sign ──
+echo "Code signing..."
+codesign --force --deep --sign - "$BUNDLE_DIR"
+
+# ── 6. Register with Launch Services ──
 echo "Registering with Launch Services..."
 "$LSREGISTER" -f "$BUNDLE_DIR"
 

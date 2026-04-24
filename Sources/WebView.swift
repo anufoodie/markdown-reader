@@ -1,25 +1,171 @@
 import SwiftUI
 import WebKit
 
-class WebViewRef: ObservableObject {
-    var webView: WKWebView?
+struct FindResult {
+    var current: Int = 0
+    var total: Int = 0
+}
 
-    func find(_ text: String, backwards: Bool = false, completion: ((Bool) -> Void)? = nil) {
-        guard let webView else { return }
-        let config = WKFindConfiguration()
-        config.wraps = true
-        config.caseSensitive = false
-        config.backwards = backwards
-        if text.isEmpty {
-            webView.find("", configuration: config) { _ in completion?(false) }
-        } else {
-            webView.find(text, configuration: config) { result in completion?(result.matchFound) }
+// MARK: - WebViewRef (owns the WKWebView and all content loading)
+
+/// Click payload from the web view. May include a text selection within the block.
+struct BlockClickPayload {
+    var blockId: Int
+    var selectionText: String?
+    var selectionOffset: Int?
+}
+
+class WebViewRef: ObservableObject {
+    let webView: WKWebView
+    var onWikilinkTapped: (String) -> Void = { _ in }
+    var onBlockClicked: (BlockClickPayload) -> Void = { _ in }
+    private let coordinator: WebViewCoordinator
+    private var lastMarkdown: String = ""
+    private var lastTheme: AppTheme = .system
+    private var lastFontSize: Int = 16
+    private var lastMarginWidth: MarginWidth = .wide
+    private var lastFileURL: URL? = nil
+    private var lastReviewMode: Bool = false
+    private var lastFocusedBlock: Int = -1
+    private var lastCommentedBlocks: Set<Int> = []
+
+    init() {
+        let coord = WebViewCoordinator()
+        self.coordinator = coord
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+        config.userContentController.add(coord, name: "wikilink")
+        config.userContentController.add(coord, name: "blockClick")
+        let wv = WKWebView(frame: .zero, configuration: config)
+        wv.setValue(false, forKey: "drawsBackground")
+        self.webView = wv
+        coord.ref = self
+    }
+
+    func loadIfNeeded(markdown: String, marginWidth: MarginWidth, theme: AppTheme,
+                      fontSize: Int, fileURL: URL?) {
+        guard markdown != lastMarkdown || theme != lastTheme ||
+              fontSize != lastFontSize || marginWidth != lastMarginWidth ||
+              fileURL != lastFileURL else { return }
+        lastMarkdown = markdown
+        lastTheme = theme
+        lastFontSize = fontSize
+        lastMarginWidth = marginWidth
+        lastFileURL = fileURL
+        // Reset review state; will be re-applied after load.
+        lastFocusedBlock = -1
+        lastCommentedBlocks = []
+        let html = MarkdownHTMLRenderer.renderFullPage(
+            markdown: markdown, marginWidth: marginWidth, theme: theme, fontSize: fontSize)
+        let base = fileURL?.deletingLastPathComponent()
+        webView.loadHTMLString(html, baseURL: base)
+    }
+
+    // MARK: - Review Mode controls
+
+    func setReviewMode(_ on: Bool) {
+        guard on != lastReviewMode else { return }
+        lastReviewMode = on
+        webView.evaluateJavaScript("setReviewMode(\(on ? "true" : "false"))")
+    }
+
+    func focusBlock(_ index: Int, scroll: Bool = true) {
+        guard index != lastFocusedBlock else { return }
+        lastFocusedBlock = index
+        webView.evaluateJavaScript("focusBlock(\(index), \(scroll ? "true" : "false"))")
+    }
+
+    /// Trigger "comment on current selection" via JS — posts a blockClick
+    /// message with whatever is selected, or falls back to the passed block index.
+    func commentOnCurrentSelection(fallbackBlock: Int) {
+        webView.evaluateJavaScript("commentOnCurrentSelection(\(fallbackBlock))")
+    }
+
+    func setCommentedBlocks(_ blocks: Set<Int>) {
+        guard blocks != lastCommentedBlocks else { return }
+        lastCommentedBlocks = blocks
+        let arr = blocks.sorted().map(String.init).joined(separator: ",")
+        webView.evaluateJavaScript("setCommentedBlocks([\(arr)])")
+    }
+
+    // MARK: - Find
+
+    private func parseFindResult(_ result: Any?) -> FindResult {
+        guard let json = result as? String,
+              let data = json.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let current = dict["current"] as? Int,
+              let total = dict["total"] as? Int else {
+            return FindResult()
+        }
+        return FindResult(current: current, total: total)
+    }
+
+    func find(_ text: String, completion: ((FindResult) -> Void)? = nil) {
+        let escaped = text.replacingOccurrences(of: "\\", with: "\\\\")
+                         .replacingOccurrences(of: "'", with: "\\'")
+                         .replacingOccurrences(of: "\n", with: "\\n")
+        let js = text.isEmpty ? "clearFindHighlights(); JSON.stringify({current:0,total:0})"
+                              : "findAndHighlight('\(escaped)')"
+        webView.evaluateJavaScript(js) { [weak self] result, _ in
+            completion?(self?.parseFindResult(result) ?? FindResult())
         }
     }
 
-    func findNext(_ text: String) { find(text, backwards: false) }
-    func findPrevious(_ text: String) { find(text, backwards: true) }
+    func findNext(completion: ((FindResult) -> Void)? = nil) {
+        webView.evaluateJavaScript("findNavigate(true)") { [weak self] result, _ in
+            completion?(self?.parseFindResult(result) ?? FindResult())
+        }
+    }
+
+    func findPrevious(completion: ((FindResult) -> Void)? = nil) {
+        webView.evaluateJavaScript("findNavigate(false)") { [weak self] result, _ in
+            completion?(self?.parseFindResult(result) ?? FindResult())
+        }
+    }
+
+    func clearFind() {
+        webView.evaluateJavaScript("clearFindHighlights()")
+    }
 }
+
+// MARK: - Wikilink Coordinator
+
+class WebViewCoordinator: NSObject, WKScriptMessageHandler {
+    weak var ref: WebViewRef?
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        if message.name == "wikilink", let target = message.body as? String {
+            DispatchQueue.main.async { [weak self] in self?.ref?.onWikilinkTapped(target) }
+        } else if message.name == "blockClick" {
+            var payload: BlockClickPayload?
+            // New JSON form: {"blockId": N, "text"?: "…", "offset"?: M}
+            if let jsonStr = message.body as? String,
+               let data = jsonStr.data(using: .utf8),
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let idx = (dict["blockId"] as? Int) ?? (dict["blockId"] as? NSNumber)?.intValue {
+                let text = dict["text"] as? String
+                let offset = (dict["offset"] as? Int) ?? (dict["offset"] as? NSNumber)?.intValue
+                payload = BlockClickPayload(blockId: idx,
+                                            selectionText: text?.isEmpty == false ? text : nil,
+                                            selectionOffset: offset)
+            } else if let n = message.body as? Int {
+                // Legacy form (shouldn't occur with current JS, kept defensive)
+                payload = BlockClickPayload(blockId: n, selectionText: nil, selectionOffset: nil)
+            } else if let n = message.body as? NSNumber {
+                payload = BlockClickPayload(blockId: n.intValue, selectionText: nil, selectionOffset: nil)
+            }
+            if let payload {
+                DispatchQueue.main.async { [weak self] in
+                    self?.ref?.onBlockClicked(payload)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - MarkdownWebView (thin NSViewRepresentable wrapper)
 
 struct MarkdownWebView: NSViewRepresentable {
     let markdown: String
@@ -29,50 +175,34 @@ struct MarkdownWebView: NSViewRepresentable {
     let webViewRef: WebViewRef
     var fileURL: URL? = nil
     var onWikilinkTapped: (String) -> Void = { _ in }
-
-    func makeCoordinator() -> Coordinator { Coordinator(onWikilinkTapped: onWikilinkTapped) }
+    var onBlockClicked: (BlockClickPayload) -> Void = { _ in }
+    var reviewMode: Bool = false
+    var focusedBlockIndex: Int = -1
+    var commentedBlocks: Set<Int> = []
 
     func makeNSView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.preferences.setValue(true, forKey: "developerExtrasEnabled")
-        config.userContentController.add(context.coordinator, name: "wikilink")
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.setValue(false, forKey: "drawsBackground")
-        webViewRef.webView = webView
-        loadContent(webView)
-        return webView
+        webViewRef.onWikilinkTapped = onWikilinkTapped
+        webViewRef.onBlockClicked = onBlockClicked
+        webViewRef.loadIfNeeded(markdown: markdown, marginWidth: marginWidth,
+                                theme: theme, fontSize: fontSize, fileURL: fileURL)
+        applyReviewState()
+        return webViewRef.webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
-        context.coordinator.onWikilinkTapped = onWikilinkTapped
-        loadContent(webView)
+        webViewRef.onWikilinkTapped = onWikilinkTapped
+        webViewRef.onBlockClicked = onBlockClicked
+        webViewRef.loadIfNeeded(markdown: markdown, marginWidth: marginWidth,
+                                theme: theme, fontSize: fontSize, fileURL: fileURL)
+        applyReviewState()
     }
 
-    private func loadContent(_ webView: WKWebView) {
-        let html = MarkdownHTMLRenderer.renderFullPage(
-            markdown: markdown,
-            marginWidth: marginWidth,
-            theme: theme,
-            fontSize: fontSize
-        )
-        let base = fileURL?.deletingLastPathComponent()
-        webView.loadHTMLString(html, baseURL: base)
-    }
-
-    // MARK: - Coordinator (handles wikilink messages from JS)
-
-    class Coordinator: NSObject, WKScriptMessageHandler {
-        var onWikilinkTapped: (String) -> Void
-
-        init(onWikilinkTapped: @escaping (String) -> Void) {
-            self.onWikilinkTapped = onWikilinkTapped
-        }
-
-        func userContentController(_ userContentController: WKUserContentController,
-                                   didReceive message: WKScriptMessage) {
-            if message.name == "wikilink", let target = message.body as? String {
-                DispatchQueue.main.async { self.onWikilinkTapped(target) }
-            }
+    private func applyReviewState() {
+        // Review-mode calls are no-ops if state hasn't changed.
+        webViewRef.setReviewMode(reviewMode)
+        webViewRef.setCommentedBlocks(commentedBlocks)
+        if reviewMode && focusedBlockIndex >= 0 {
+            webViewRef.focusBlock(focusedBlockIndex)
         }
     }
 }
@@ -487,9 +617,62 @@ struct MarkdownHTMLRenderer {
     a.wikilink { color: var(--accent); border-bottom: 1px dashed var(--accent); }
     a.wikilink:hover { border-bottom-style: solid; }
 
+    /* ── Find highlights ── */
+    mark.find-hl {
+        background: rgba(250, 204, 21, 0.4);
+        color: inherit;
+        border-radius: 2px;
+        padding: 1px 0;
+    }
+    mark.find-hl.find-hl-active {
+        background: rgba(250, 204, 21, 0.85);
+        outline: 2px solid rgba(250, 204, 21, 0.9);
+        outline-offset: 1px;
+    }
+
     /* ── Misc ── */
     del { color: var(--text-secondary); text-decoration: line-through; }
     .section-hidden { display: none; }
+
+    /* ── Review Mode ── */
+    body.review-mode #content > *[data-block-id] {
+        position: relative;
+        transition: background 0.12s ease, box-shadow 0.12s ease;
+        border-radius: 4px;
+    }
+    body.review-mode #content > *[data-block-id]:hover {
+        background: var(--accent-soft);
+        cursor: pointer;
+    }
+    body.review-mode #content > *[data-block-id]:hover::before {
+        content: '+';
+        position: absolute;
+        left: -28px; top: 4px;
+        font-family: 'Inter', sans-serif; font-weight: 500;
+        font-size: 0.75em; color: var(--accent);
+        width: 20px; height: 20px; line-height: 18px;
+        text-align: center;
+        border: 1px solid var(--accent);
+        border-radius: 50%;
+        background: var(--bg);
+        opacity: 0.9;
+    }
+    body.review-mode #content > *[data-block-id].block-focused {
+        box-shadow: inset 3px 0 0 var(--accent);
+        background: var(--accent-soft);
+    }
+    body.review-mode #content > *[data-block-id].block-commented::after {
+        content: attr(data-comment-count);
+        position: absolute;
+        right: -32px; top: 4px;
+        font-family: 'Inter', sans-serif; font-weight: 600;
+        font-size: 0.65em; color: white;
+        background: var(--accent);
+        min-width: 18px; height: 18px; padding: 0 5px;
+        line-height: 18px; text-align: center;
+        border-radius: 9px;
+        box-shadow: var(--shadow-sm);
+    }
 
     /* ── Scrollbar ── */
     ::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -511,6 +694,13 @@ struct MarkdownHTMLRenderer {
 
     static let js = ##"""
     // ── Collapsible sections ──
+    //
+    // Design: each heading can carry a `.collapsed` class independently.
+    // Visibility is a *derived* view of the DOM, recomputed in one linear pass
+    // from the current `.collapsed` flags. This keeps nesting correct even
+    // after collapse → collapse-parent → expand-parent sequences, where the
+    // previous implementation lost track and over-reveal content under a
+    // still-collapsed inner heading.
     function setupCollapsible() {
         document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(header) {
             var indicator = document.createElement('span');
@@ -524,67 +714,74 @@ struct MarkdownHTMLRenderer {
         });
     }
 
-    function toggleSection(header) {
-        var level = parseInt(header.tagName[1]);
-        var isCollapsed = header.classList.toggle('collapsed');
+    function isHeading(el) {
+        return el && el.matches && el.matches('h1,h2,h3,h4,h5,h6');
+    }
+
+    function setCollapsedIndicator(header, collapsed) {
         var indicator = header.querySelector('.collapse-indicator');
-        if (indicator) indicator.textContent = isCollapsed ? '\u{25B6}' : '\u{25BC}';
-        var next = header.nextElementSibling;
-        while (next) {
-            if (next.matches && next.matches('h1,h2,h3,h4,h5,h6')) {
-                if (parseInt(next.tagName[1]) <= level) break;
-            }
-            if (isCollapsed) {
-                next.classList.add('section-hidden');
-            } else {
-                if (!isParentCollapsed(next, level)) {
-                    next.classList.remove('section-hidden');
-                    if (next.matches && next.matches('h1,h2,h3,h4,h5,h6') && next.classList.contains('collapsed')) {
-                        var innerLevel = parseInt(next.tagName[1]);
-                        var innerNext = next.nextElementSibling;
-                        while (innerNext) {
-                            if (innerNext.matches && innerNext.matches('h1,h2,h3,h4,h5,h6')) {
-                                if (parseInt(innerNext.tagName[1]) <= innerLevel) break;
-                            }
-                            innerNext.classList.add('section-hidden');
-                            innerNext = innerNext.nextElementSibling;
-                        }
-                    }
+        if (indicator) indicator.textContent = collapsed ? '\u{25B6}' : '\u{25BC}';
+    }
+
+    /// Recompute the `section-hidden` class across the whole document from the
+    /// current set of `.collapsed` headings. O(n) in top-level-children count.
+    function reapplyCollapseVisibility() {
+        var content = document.getElementById('content');
+        if (!content) return;
+        var children = content.children;
+        // Stack of heading levels whose sections are currently collapsed.
+        // An element is hidden iff the stack is non-empty.
+        // Heading rules: a heading at level L ends any stacked level >= L.
+        var stack = [];
+        for (var i = 0; i < children.length; i++) {
+            var el = children[i];
+            if (isHeading(el)) {
+                var level = parseInt(el.tagName[1]);
+                // Pop headings at same-or-deeper level — they are not ancestors.
+                while (stack.length && stack[stack.length - 1] >= level) {
+                    stack.pop();
                 }
+                // The heading itself is hidden iff an ancestor is collapsed.
+                setHidden(el, stack.length > 0);
+                // If THIS heading is collapsed, push its level so descendants hide.
+                if (el.classList.contains('collapsed')) {
+                    stack.push(level);
+                }
+            } else {
+                // Non-heading: hidden iff any ancestor heading is collapsed.
+                setHidden(el, stack.length > 0);
             }
-            next = next.nextElementSibling;
         }
     }
 
-    function isParentCollapsed(element, aboveLevel) {
-        var prev = element.previousElementSibling;
-        while (prev) {
-            if (prev.matches && prev.matches('h1,h2,h3,h4,h5,h6')) {
-                var prevLevel = parseInt(prev.tagName[1]);
-                if (prevLevel < aboveLevel && prev.classList.contains('collapsed')) return true;
-            }
-            prev = prev.previousElementSibling;
+    function setHidden(el, hidden) {
+        if (hidden) {
+            if (!el.classList.contains('section-hidden')) el.classList.add('section-hidden');
+        } else {
+            if (el.classList.contains('section-hidden')) el.classList.remove('section-hidden');
         }
-        return false;
+    }
+
+    function toggleSection(header) {
+        var isCollapsed = header.classList.toggle('collapsed');
+        setCollapsedIndicator(header, isCollapsed);
+        reapplyCollapseVisibility();
     }
 
     function collapseAll() {
         document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h) {
-            if (!h.classList.contains('collapsed')) toggleSection(h);
+            h.classList.add('collapsed');
+            setCollapsedIndicator(h, true);
         });
+        reapplyCollapseVisibility();
     }
 
     function expandAll() {
         document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h) {
-            if (h.classList.contains('collapsed')) {
-                h.classList.remove('collapsed');
-                var ind = h.querySelector('.collapse-indicator');
-                if (ind) ind.textContent = '\u{25BC}';
-            }
+            h.classList.remove('collapsed');
+            setCollapsedIndicator(h, false);
         });
-        document.querySelectorAll('.section-hidden').forEach(function(el) {
-            el.classList.remove('section-hidden');
-        });
+        reapplyCollapseVisibility();
     }
 
     // ── Scroll to heading (for TOC) ──
@@ -743,8 +940,230 @@ struct MarkdownHTMLRenderer {
         });
     }
 
+    // ── Find / Highlight ──
+    var _findMatches = [];
+    var _findCurrent = -1;
+
+    function findAndHighlight(text) {
+        clearFindHighlights();
+        if (!text) return JSON.stringify({current: 0, total: 0});
+        var body = document.getElementById('content');
+        var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, null);
+        var textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        var lower = text.toLowerCase();
+        textNodes.forEach(function(node) {
+            var parent = node.parentNode;
+            if (!parent || parent.tagName === 'SCRIPT' || parent.tagName === 'STYLE') return;
+            var val = node.nodeValue;
+            var idx = val.toLowerCase().indexOf(lower);
+            if (idx === -1) return;
+            var frag = document.createDocumentFragment();
+            var pos = 0;
+            while (idx !== -1) {
+                if (idx > pos) frag.appendChild(document.createTextNode(val.substring(pos, idx)));
+                var mark = document.createElement('mark');
+                mark.className = 'find-hl';
+                mark.textContent = val.substring(idx, idx + text.length);
+                frag.appendChild(mark);
+                pos = idx + text.length;
+                idx = val.toLowerCase().indexOf(lower, pos);
+            }
+            if (pos < val.length) frag.appendChild(document.createTextNode(val.substring(pos)));
+            parent.replaceChild(frag, node);
+        });
+        _findMatches = Array.from(document.querySelectorAll('mark.find-hl'));
+        _findCurrent = _findMatches.length > 0 ? 0 : -1;
+        if (_findCurrent >= 0) {
+            _findMatches[0].classList.add('find-hl-active');
+            _findMatches[0].scrollIntoView({behavior: 'smooth', block: 'center'});
+        }
+        return JSON.stringify({current: _findCurrent + 1, total: _findMatches.length});
+    }
+
+    function findNavigate(forward) {
+        if (_findMatches.length === 0) return JSON.stringify({current: 0, total: 0});
+        _findMatches[_findCurrent].classList.remove('find-hl-active');
+        if (forward) {
+            _findCurrent = (_findCurrent + 1) % _findMatches.length;
+        } else {
+            _findCurrent = (_findCurrent - 1 + _findMatches.length) % _findMatches.length;
+        }
+        _findMatches[_findCurrent].classList.add('find-hl-active');
+        _findMatches[_findCurrent].scrollIntoView({behavior: 'smooth', block: 'center'});
+        return JSON.stringify({current: _findCurrent + 1, total: _findMatches.length});
+    }
+
+    function clearFindHighlights() {
+        document.querySelectorAll('mark.find-hl').forEach(function(mark) {
+            var parent = mark.parentNode;
+            parent.replaceChild(document.createTextNode(mark.textContent), mark);
+            parent.normalize();
+        });
+        _findMatches = [];
+        _findCurrent = -1;
+    }
+
+    // ── Review Mode ──
+    var _focusedBlockIndex = -1;
+    var _commentedBlocks = {};  // index → count
+
+    function tagBlocksWithIds() {
+        var content = document.getElementById('content');
+        if (!content) return;
+        var children = Array.from(content.children);
+        for (var i = 0; i < children.length; i++) {
+            children[i].setAttribute('data-block-id', String(i));
+        }
+    }
+
+    function setReviewMode(on) {
+        if (on) {
+            document.body.classList.add('review-mode');
+        } else {
+            document.body.classList.remove('review-mode');
+            var f = document.querySelector('#content > .block-focused');
+            if (f) f.classList.remove('block-focused');
+            _focusedBlockIndex = -1;
+        }
+    }
+
+    function focusBlock(index, scroll) {
+        var content = document.getElementById('content');
+        if (!content) return;
+        var all = content.querySelectorAll('[data-block-id]');
+        all.forEach(function(el) { el.classList.remove('block-focused'); });
+        if (index < 0 || index >= all.length) { _focusedBlockIndex = -1; return; }
+        var target = all[index];
+        target.classList.add('block-focused');
+        _focusedBlockIndex = index;
+        if (scroll) {
+            var rect = target.getBoundingClientRect();
+            var inView = rect.top >= 60 && rect.bottom <= window.innerHeight - 40;
+            if (!inView) {
+                target.scrollIntoView({behavior: 'smooth', block: 'center'});
+            }
+        }
+    }
+
+    function setCommentedBlocks(indexList) {
+        var content = document.getElementById('content');
+        if (!content) return;
+        // Clear
+        content.querySelectorAll('.block-commented').forEach(function(el) {
+            el.classList.remove('block-commented');
+            el.removeAttribute('data-comment-count');
+        });
+        _commentedBlocks = {};
+        // Count occurrences
+        for (var i = 0; i < indexList.length; i++) {
+            var idx = indexList[i];
+            _commentedBlocks[idx] = (_commentedBlocks[idx] || 0) + 1;
+        }
+        // Apply
+        Object.keys(_commentedBlocks).forEach(function(idx) {
+            var el = content.querySelector('[data-block-id="' + idx + '"]');
+            if (el) {
+                el.classList.add('block-commented');
+                el.setAttribute('data-comment-count', String(_commentedBlocks[idx]));
+            }
+        });
+    }
+
+    function computeSelectionPayload(blockEl) {
+        // Returns {text, offsetInBlock} if there's a non-collapsed selection
+        // fully inside blockEl; otherwise null.
+        try {
+            var sel = window.getSelection();
+            if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+            var range = sel.getRangeAt(0);
+            if (!blockEl.contains(range.commonAncestorContainer) &&
+                range.commonAncestorContainer !== blockEl) return null;
+            var text = sel.toString();
+            if (!text || text.length === 0) return null;
+            // Compute offset as: length of text from blockEl.start → range.startContainer+startOffset
+            var pre = document.createRange();
+            pre.selectNodeContents(blockEl);
+            pre.setEnd(range.startContainer, range.startOffset);
+            var offset = pre.toString().length;
+            return { text: text, offsetInBlock: offset };
+        } catch (e) { return null; }
+    }
+
+    function postBlockClick(blockId, selection) {
+        if (!window.webkit || !window.webkit.messageHandlers ||
+            !window.webkit.messageHandlers.blockClick) return;
+        var payload;
+        if (selection && selection.text) {
+            payload = JSON.stringify({
+                blockId: blockId,
+                text: selection.text,
+                offset: selection.offsetInBlock
+            });
+        } else {
+            payload = JSON.stringify({ blockId: blockId });
+        }
+        window.webkit.messageHandlers.blockClick.postMessage(payload);
+    }
+
+    function setupBlockClickHandler() {
+        var content = document.getElementById('content');
+        if (!content) return;
+        content.addEventListener('click', function(e) {
+            if (!document.body.classList.contains('review-mode')) return;
+            var el = e.target;
+            while (el && el !== content) {
+                if (el.getAttribute && el.getAttribute('data-block-id') !== null) {
+                    var id = parseInt(el.getAttribute('data-block-id'), 10);
+                    if (!isNaN(id)) {
+                        // If a non-collapsed selection lives inside this block,
+                        // treat the click as "comment on selection".
+                        var sel = computeSelectionPayload(el);
+                        // If selection exists but click didn't happen inside it,
+                        // still prefer the selection — reviewer's signal.
+                        e.preventDefault();
+                        e.stopPropagation();
+                        postBlockClick(id, sel);
+                        return;
+                    }
+                }
+                el = el.parentNode;
+            }
+        }, true);
+    }
+
+    // Explicit "comment on current selection" — called by Swift on `c` keypress
+    // so keyboard-driven flow can anchor on a highlighted range.
+    function commentOnCurrentSelection(fallbackBlockIndex) {
+        var sel = window.getSelection();
+        if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+            // No selection: just open the focused block.
+            if (fallbackBlockIndex >= 0) {
+                postBlockClick(fallbackBlockIndex, null);
+            }
+            return;
+        }
+        // Find the block containing the selection.
+        var node = sel.anchorNode;
+        while (node && node !== document.body) {
+            if (node.getAttribute && node.getAttribute('data-block-id') !== null) {
+                var id = parseInt(node.getAttribute('data-block-id'), 10);
+                if (!isNaN(id)) {
+                    var payload = computeSelectionPayload(node);
+                    postBlockClick(id, payload);
+                    return;
+                }
+            }
+            node = node.parentNode;
+        }
+        // Couldn't resolve to a block: fallback.
+        if (fallbackBlockIndex >= 0) postBlockClick(fallbackBlockIndex, null);
+    }
+
     // ── Init ──
     setupCollapsible();
     highlightCode();
+    tagBlocksWithIds();
+    setupBlockClickHandler();
     """##
 }
